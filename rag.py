@@ -9,17 +9,19 @@ import os
 import re
 from threading import Thread
 from typing import Union, List
+import pprint
 
 import jieba
 import torch
 from loguru import logger
 from peft import PeftModel
-from similarities import (
-    EnsembleSimilarity,
-    BertSimilarity,
-    BM25Similarity,
+
+from cal_similarites import (
+    MyEnsembleSimilarity as EnsembleSimilarity,
+    MyBertSimilarity as BertSimilarity,
+    MyBM25Similarity as BM25Similarity,
+    SimilarityABC
 )
-from similarities.similarity import SimilarityABC
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
@@ -32,6 +34,7 @@ from transformers import (
     GenerationConfig,
     AutoModelForSequenceClassification,
 )
+import openai
 
 jieba.setLogLevel("ERROR")
 
@@ -121,7 +124,22 @@ class SentenceSplitter:
             overlapped_chunks.append(chunk.strip())
         overlapped_chunks.append(chunks[-1])
         return overlapped_chunks
+    
+import os 
+# 从环境变量中获取 OpenAI API 密钥
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY 环境变量未设置")
 
+# 从环境变量中获取 OpenAI 模型名称
+OPENAI_MODEL = os.getenv("OPENAI_MODEL")
+if not OPENAI_MODEL:
+    raise ValueError("OPENAI_MODEL 环境变量未设置")
+
+# 从环境变量中获取 API 的基础 URL
+BASE_URL = os.getenv("BASE_URL")
+if not BASE_URL:
+    raise ValueError("BASE_URL 环境变量未设置")
 
 class Rag:
     def __init__(
@@ -130,6 +148,7 @@ class Rag:
             generate_model_type: str = "auto",
             generate_model_name_or_path: str = "Qwen/Qwen2-0.5B-Instruct",
             lora_model_name_or_path: str = None,
+            corpus_files_path: str = "./corpus/",
             corpus_files: Union[str, List[str]] = None,
             save_corpus_emb_dir: str = "./corpus_embs/",
             device: str = None,
@@ -139,9 +158,12 @@ class Rag:
             chunk_overlap: int = 0,
             rerank_model_name_or_path: str = None,
             enable_history: bool = False,
-            num_expand_context_chunk: int = 2,
-            similarity_top_k: int = 10,
+            num_expand_context_chunk: int = 10,
+            similarity_top_k: int = 50,
             rerank_top_k: int = 3,
+            openai_api_key: str =  OPENAI_API_KEY,
+            openai_model: str = OPENAI_MODEL ,
+            base_url :str = BASE_URL
     ):
         """
         Init RAG model.
@@ -177,8 +199,8 @@ class Rag:
         if similarity_model is not None:
             self.sim_model = similarity_model
         else:
-            m1 = BertSimilarity(model_name_or_path="shibing624/text2vec-base-multilingual", device=self.device)
-            m2 = BM25Similarity()
+            m1 = BertSimilarity(save_path=corpus_files_path,model_name_or_path="shibing624/text2vec-base-multilingual", device=self.device)
+            m2 = BM25Similarity(save_path=corpus_files_path)
             default_sim_model = EnsembleSimilarity(similarities=[m1, m2], weights=[0.5, 0.5], c=2)
             self.sim_model = default_sim_model
         self.gen_model, self.tokenizer = self._init_gen_model(
@@ -189,6 +211,8 @@ class Rag:
             int4=int4,
         )
         self.history = []
+        corpus_files=self.get_corpus(corpus_files_path)
+        print(f"所有文档数量为:{len(corpus_files)}")
         self.corpus_files = corpus_files
         if corpus_files:
             self.add_corpus(corpus_files)
@@ -207,6 +231,10 @@ class Rag:
         self.similarity_top_k = similarity_top_k
         self.num_expand_context_chunk = num_expand_context_chunk
         self.rerank_top_k = rerank_top_k
+
+        self.openai_api_key= openai_api_key
+        self.openai_model = openai_model
+        self.base_url = base_url
 
     def __str__(self):
         return f"Similarity model: {self.sim_model}, Generate model: {self.gen_model}"
@@ -295,26 +323,48 @@ class Rag:
 
         yield from streamer
 
+    def get_corpus(self,file_path):
+        if os.path.isdir(file_path):
+            ## 递归查找所有的文档
+            all_files = []
+
+            for root, dirs, files in os.walk(file_path):
+                for file in files:
+                    if file.endswith('.docx'):
+                        all_files.append(os.path.join(root, file))
+        else:
+            all_files = [file_path]
+        return all_files
+
     def add_corpus(self, files: Union[str, List[str]]):
         """Load document files."""
         if isinstance(files, str):
             files = [files]
+        # print("corpus:",files)
+        all_chunks=[]
+        all_doc_name=[]
         for doc_file in files:
-            if doc_file.endswith('.pdf'):
-                corpus = self.extract_text_from_pdf(doc_file)
-            elif doc_file.endswith('.docx'):
-                corpus = self.extract_text_from_docx(doc_file)
-            elif doc_file.endswith('.md'):
-                corpus = self.extract_text_from_markdown(doc_file)
-            else:
-                corpus = self.extract_text_from_txt(doc_file)
+            try:
+                if doc_file.endswith('.pdf'):
+                    corpus = self.extract_text_from_pdf(doc_file)
+                elif doc_file.endswith('.docx'):
+                    corpus = self.extract_text_from_docx(doc_file)
+                elif doc_file.endswith('.md'):
+                    corpus = self.extract_text_from_markdown(doc_file)
+                else:
+                    corpus = self.extract_text_from_txt(doc_file)
+            except:
+                print(f"文件读取失败:{doc_file}")
             full_text = '\n'.join(corpus)
             chunks = self.text_splitter.split_text(full_text)
-            self.sim_model.add_corpus(chunks)
+            ##获取文件名称
+            doc_name=[os.path.basename(doc_file)]*len(chunks)
+            all_chunks.extend(chunks)
+            all_doc_name.extend(doc_name)
+        self.sim_model.add_corpus(all_chunks,all_doc_name)
         self.corpus_files = files
-        logger.debug(f"files: {files}, corpus size: {len(self.sim_model.corpus)}, top3: "
-                     f"{list(self.sim_model.corpus.values())[:3]}")
-
+        # logger.debug(f"corpus size: {len(self.sim_model.corpus)}, top3: "
+        #              f"{list(self.sim_model.corpus.values())[:3]}")
     @staticmethod
     def get_file_hash(fpaths):
         hasher = hashlib.md5()
@@ -378,6 +428,22 @@ class Rag:
         contents = [text.strip() for text in soup.get_text().splitlines() if text.strip()]
         return contents
 
+
+    def openai_stream_generate_answer(self, prompt: str, max_tokens: int = 512, temperature: float = 0.7):
+        from openai import OpenAI
+        client = OpenAI(api_key=self.openai_api_key,base_url=self.base_url)
+
+        response = client.chat.completions.create(
+            model=self.openai_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=True
+        )
+
+        for chunk in response:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
     @staticmethod
     def _add_source_numbers(lst):
         """Add source numbers to a list of strings."""
@@ -408,39 +474,79 @@ class Rag:
         sim_contents = self.sim_model.most_similar(query, topn=self.similarity_top_k)
         # Get reference results from corpus
         hit_chunk_dict = dict()
+        hit_chunk_info_dict=dict()
         for c in sim_contents:
             for id_score_dict in c:
                 corpus_id = id_score_dict['corpus_id']
                 hit_chunk = id_score_dict["corpus_doc"]
+                doc_name = id_score_dict["doc_name"]
+                score = id_score_dict["score"]
                 reference_results.append(hit_chunk)
                 hit_chunk_dict[corpus_id] = hit_chunk
+                hit_chunk_info_dict[corpus_id]={
+                    "hit_chunk":hit_chunk,
+                    "doc_name":doc_name,
+                    "score":score,
+                    "rerank_score":-99999.0,
+                    "is_rerank":False
+                }
+
+        logger.debug(f"reference_results: {len(sim_contents)},self.rerank_model:{self.rerank_model}")
 
         if reference_results:
             if self.rerank_model is not None:
                 # Rerank reference results
                 rerank_scores = self._get_reranker_score(query, reference_results)
-                logger.debug(f"rerank_scores: {rerank_scores}")
+                # logger.debug(f"rerank_scores: {rerank_scores}")
                 # Get rerank top k chunks
-                reference_results = [reference for reference, score in sorted(
+                reference_results = [(reference,score) for reference, score in sorted(
                     zip(reference_results, rerank_scores), key=lambda x: x[1], reverse=True)][:self.rerank_top_k]
-                hit_chunk_dict = {corpus_id: hit_chunk for corpus_id, hit_chunk in hit_chunk_dict.items() if
-                                  hit_chunk in reference_results}
+                ##获取reference_results第一列的值
+                # reference_results_chunks = [reference for reference, score in reference_results]
+
+                for corpus_id, hit_chunk_info in hit_chunk_info_dict.items():
+                    hit_chunk=hit_chunk_info['hit_chunk']
+                    for reference, rerank_score in reference_results:
+                        if reference == hit_chunk:
+                            ##把rerank_score 的tensor格式转为cpu的数据类型,正常的float
+                            rerank_score = rerank_score.to(torch.float32)
+                            hit_chunk_info_dict[corpus_id]["rerank_score"] = rerank_score.item()
+                            hit_chunk_info_dict[corpus_id]["is_rerank"] = True
+                
+                # hit_chunk_dict = {corpus_id: hit_chunk for corpus_id, hit_chunk in hit_chunk_dict.items() if
+                #                   hit_chunk in reference_results_chunks}
+                
+                ##按照hit_chunk_info_dict中的rerank_score排序，返回排序后的hit_chunk_info_dict
+                hit_chunk_info_dict=dict(sorted(hit_chunk_info_dict.items(), key=lambda x: x[1]["rerank_score"], reverse=True))
+        
             # Expand reference context chunk
+            new_hit_chunk_info_dict=hit_chunk_info_dict
+            print("hit_chunk_info_dict len:",len(hit_chunk_info_dict))
             if self.num_expand_context_chunk > 0:
+                new_hit_chunk_info_dict={}
                 new_reference_results = []
-                for corpus_id, hit_chunk in hit_chunk_dict.items():
+                for corpus_id, hit_chunk_info in hit_chunk_info_dict.items():
+                    hit_chunk=hit_chunk_info["hit_chunk"]
+                    is_rerank=hit_chunk_info["is_rerank"]
+                    if not is_rerank and self.rerank_model is not None:
+                        continue
                     expanded_reference = self.sim_model.corpus.get(corpus_id - 1, '') + hit_chunk
                     for i in range(self.num_expand_context_chunk):
                         expanded_reference += self.sim_model.corpus.get(corpus_id + i + 1, '')
                     new_reference_results.append(expanded_reference)
+                    hit_chunk_info['hit_chunk']=expanded_reference
+                    new_hit_chunk_info_dict[corpus_id]=hit_chunk_info
                 reference_results = new_reference_results
-        return reference_results
+                print(f"hit_chunk_info_dict len:{len(hit_chunk_info_dict)},new_reference_results:{len(new_reference_results)}")
+        # import json 
+        # logger.debug(json.dumps(new_hit_chunk_info_dict,indent=4,ensure_ascii=False))
+        return reference_results,new_hit_chunk_info_dict
 
     def predict_stream(
             self,
             query: str,
             max_length: int = 512,
-            context_len: int = 2048,
+            context_len: int = 2048*20,
             temperature: float = 0.7,
     ):
         """Generate predictions stream."""
@@ -448,7 +554,8 @@ class Rag:
         if not self.enable_history:
             self.history = []
         if self.sim_model.corpus:
-            reference_results = self.get_reference_results(query)
+            reference_results,hit_chunk_info_dict = self.get_reference_results(query)
+            # print(len(reference_results))
             if reference_results:
                 reference_results = self._add_source_numbers(reference_results)
                 context_str = '\n'.join(reference_results)[:(context_len - len(PROMPT_TEMPLATE))]
@@ -457,23 +564,31 @@ class Rag:
             prompt = PROMPT_TEMPLATE.format(context_str=context_str, query_str=query)
         else:
             prompt = query
-        logger.debug(f"prompt: {prompt}")
+        
+        self.context_str=context_str
+        # logger.debug(f"prompt: {prompt}")
         self.history.append([prompt, ''])
         response = ""
-        for new_text in self.stream_generate_answer(
-                max_new_tokens=max_length,
-                temperature=temperature,
-                context_len=context_len,
-        ):
-            if new_text != stop_str:
+        if self.openai_api_key:
+        # 使用 OpenAI 的流式回答
+            for new_text in self.openai_stream_generate_answer(prompt, max_tokens=max_length, temperature=temperature):
                 response += new_text
                 yield response
+        else:
+            for new_text in self.stream_generate_answer(
+                    max_new_tokens=max_length,
+                    temperature=temperature,
+                    context_len=context_len,
+            ):
+                if new_text != stop_str:
+                    response += new_text
+                    yield response
 
     def predict(
             self,
             query: str,
             max_length: int = 512,
-            context_len: int = 2048,
+            context_len: int = 2048*20,
             temperature: float = 0.7,
     ):
         """Query from corpus."""
@@ -481,27 +596,34 @@ class Rag:
         if not self.enable_history:
             self.history = []
         if self.sim_model.corpus:
-            reference_results = self.get_reference_results(query)
+            reference_results,hit_chunk_info_dict = self.get_reference_results(query)
             if reference_results:
+                # print(reference_results)
                 reference_results = self._add_source_numbers(reference_results)
+                # print(f"after reference_results len:{len(reference_results)}")
                 context_str = '\n'.join(reference_results)[:(context_len - len(PROMPT_TEMPLATE))]
             else:
                 context_str = ''
             prompt = PROMPT_TEMPLATE.format(context_str=context_str, query_str=query)
         else:
             prompt = query
-        logger.debug(f"prompt: {prompt}")
+        # logger.debug(f"prompt: {prompt}")
         self.history.append([prompt, ''])
         response = ""
-        for new_text in self.stream_generate_answer(
-                max_new_tokens=max_length,
-                temperature=temperature,
-                context_len=context_len,
-        ):
-            response += new_text
+        if self.openai_api_key:
+        # 使用 OpenAI 的流式回答
+            for new_text in self.openai_stream_generate_answer(prompt, max_tokens=max_length, temperature=temperature):
+                response += new_text
+        else:
+            for new_text in self.stream_generate_answer(
+                    max_new_tokens=max_length,
+                    temperature=temperature,
+                    context_len=context_len,
+            ):
+                response += new_text
         response = response.strip()
         self.history[-1][1] = response
-        return response, reference_results
+        return response, hit_chunk_info_dict,prompt
 
     def query(self, query: str, **kwargs):
         return self.predict(query, **kwargs)
@@ -526,7 +648,7 @@ if __name__ == "__main__":
     parser.add_argument("--gen_model_type", type=str, default="auto")
     parser.add_argument("--gen_model_name", type=str, default="Qwen/Qwen2-0.5B-Instruct")
     parser.add_argument("--lora_model", type=str, default=None)
-    parser.add_argument("--rerank_model_name", type=str, default="")
+    parser.add_argument("--rerank_model_name", type=str, default=None)
     parser.add_argument("--corpus_files", type=str, default="data/sample.pdf")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--int4", action='store_true', help="use int4 quantization")
@@ -538,7 +660,7 @@ if __name__ == "__main__":
     print(args)
     sim_model = BertSimilarity(model_name_or_path=args.sim_model_name, device=args.device)
     m = Rag(
-        similarity_model=sim_model,
+        # similarity_model=sim_model,
         generate_model_type=args.gen_model_type,
         generate_model_name_or_path=args.gen_model_name,
         lora_model_name_or_path=args.lora_model,
@@ -551,5 +673,5 @@ if __name__ == "__main__":
         num_expand_context_chunk=args.num_expand_context_chunk,
         rerank_model_name_or_path=args.rerank_model_name,
     )
-    r, refs = m.predict('自然语言中的非平行迁移是指什么？')
-    print(r, refs)
+    response, hit_chunk_info_dict,prompt = m.predict('介绍下康复师.')
+    print(response)
