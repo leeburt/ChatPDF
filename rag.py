@@ -46,14 +46,20 @@ MODEL_CLASSES = {
     "auto": (AutoModelForCausalLM, AutoTokenizer),
 }
 
-PROMPT_TEMPLATE = """基于以下已知信息，简洁和专业的来回答用户的问题。用简体中文回答。
+PROMPT_TEMPLATE = """基于以下已知信息，专业的来回答用户的问题，用简体中文按照逻辑详细回答，同时标注对应的证据来源。回答时注意仔细阅读所有提供的资料也即是下方提供的已知内容，提取出与问题 {query_str} 相关的内容，并正确引用对应的已知内容的编号。
+所有已知内容需要逐一查看，识别出与问题 {query_str} 相关的关键点,并正确引用对应的证据编号。同时要注意不同证据之间可能存在的矛盾，并确保输出的信息全面且准确
+。
 
-已知内容:
+【已知内容】:
 {context_str}
 
-问题:
+【问题】:
 {query_str}
+
+如果问题和已知内容不匹配，则不要解释直接输出:未找到有关 {query_str} 的结果。
+
 """
+
 
 
 class SentenceSplitter:
@@ -213,6 +219,7 @@ class Rag:
         self.history = []
         corpus_files=self.get_corpus(corpus_files_path)
         print(f"所有文档数量为:{len(corpus_files)}")
+        self.convert_docx_to_markdown(corpus_files_path)
         self.corpus_files = corpus_files
         if corpus_files:
             self.add_corpus(corpus_files)
@@ -335,6 +342,42 @@ class Rag:
         else:
             all_files = [file_path]
         return all_files
+    
+    def convert_docx_to_markdown(self,docx_path):
+        from docx import Document
+        def extract_text_from_docx(file_path):
+            """
+            从 .docx 文件中提取文本内容。
+            """
+            try:
+                full_text = []
+                doc = Document(file_path)
+                full_text = []
+                for para in doc.paragraphs:
+                    full_text.append(para.text)
+            except:
+                logger.error(f"Failed to load docx file: {file_path}")
+            return '\n'.join(full_text)
+        """
+        递归遍历指定路径下的所有 .docx 文件，并将内容写入 Markdown 文件。
+        """
+        markdown_path=os.path.join(docx_path, 'all_corpus.md')
+        # if os.path.exists(markdown_path):
+        #     logger.debug(f"{markdown_path} exists, skip!!!")
+        #     return
+        
+        with open(markdown_path, 'w', encoding='utf-8') as md_file:
+            file_list=self.get_corpus(docx_path)
+            # print(markdown_path,file_list)
+            for file in file_list:
+                file_name = os.path.basename(file)  # 去掉 .docx 后缀
+                md_file.write(f"# {file_name}\n\n")
+                # 提取 .docx 文件内容
+                docx_content = extract_text_from_docx(file)
+                # 将内容写入 Markdown 文件
+                md_file.write(f"{docx_content}\n\n")
+        logger.debug(f"write all corpus to {markdown_path}")
+        return 
 
     def add_corpus(self, files: Union[str, List[str]]):
         """Load document files."""
@@ -484,6 +527,7 @@ class Rag:
                 reference_results.append(hit_chunk)
                 hit_chunk_dict[corpus_id] = hit_chunk
                 hit_chunk_info_dict[corpus_id]={
+                    "corpus_id":corpus_id,
                     "hit_chunk":hit_chunk,
                     "doc_name":doc_name,
                     "score":score,
@@ -540,6 +584,7 @@ class Rag:
                 print(f"hit_chunk_info_dict len:{len(hit_chunk_info_dict)},new_reference_results:{len(new_reference_results)}")
         # import json 
         # logger.debug(json.dumps(new_hit_chunk_info_dict,indent=4,ensure_ascii=False))
+        new_hit_chunk_info_dict={i+1:v for i,(k,v) in enumerate(new_hit_chunk_info_dict.items())}
         return reference_results,new_hit_chunk_info_dict
 
     def predict_stream(

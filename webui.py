@@ -12,7 +12,7 @@ def predict_stream(message, history):
     for human, assistant in history:
         history_format.append([human, assistant])
     model.history = history_format
-    for chunk in model.predict_stream(message,max_length=2048):
+    for chunk in model.predict_stream(message,max_length=2048*2):
         yield chunk
 
 def predict(message, history):
@@ -24,7 +24,7 @@ def predict(message, history):
 
 # Define the API function
 def api_predict(query):
-    response, reference_results,prompt = model.predict(query,max_length=2048)
+    response, reference_results,prompt = model.predict(query,max_length=2048*2)
     reference_results=json.dumps(reference_results,indent=4,ensure_ascii=False)
     return response,reference_results,prompt
 
@@ -35,7 +35,7 @@ if __name__ == '__main__':
     parser.add_argument("--lora_model", type=str, default=None)
     parser.add_argument("--rerank_model_name", type=str, default='')
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--corpus_files_path", type=str, default="/Users/lee/Documents/work/干预助手/dataset/知识库")
+    parser.add_argument("--corpus_files_path", type=str, default="/Users/lee/Documents/work/干预助手/dataset/知识库/源爸写的文章合集_校对版本")
     parser.add_argument("--int4", action='store_true', help="use int4 quantization")
     parser.add_argument("--int8", action='store_true', help="use int8 quantization")
     parser.add_argument("--chunk_size", type=int, default=220)
@@ -101,7 +101,9 @@ if __name__ == '__main__':
             with gr.TabItem("API"):
                 tcss = """
                     .gr-code {
-                        white-space: pre-wrap;
+                        white-space: pre-wrap; /* 自动换行 */
+                        word-wrap: break-word; /* 确保单词内部换行 */
+                        overflow-wrap: break-word; /* 确保单词内部换行 */
                     }
                     """
                 # API Interface
@@ -111,9 +113,12 @@ if __name__ == '__main__':
                     # outputs=gr.Code(label="output", language="json"),#gr.JSON(height=60,label="Api Result Output"),
                     css=tcss,
                     outputs=[
-                            gr.Textbox(lines=10,label="Response"),  # 回应
+                            ##mk输出
+                            gr.Markdown(height=20,label="Api Result Output",show_copy_button=True),
+                            # gr.Textbox(lines=10,label="Response"),  # 回应
                             gr.Code(label="Reference Files", scale=20,language="json"),  # 参考文件
-                            gr.Textbox(lines=10,label="Prompt"),  # prompt
+
+                            gr.Markdown(height=20,label="Prompt"),  # prompt
                             ],
                     title="RAG API",
                     description="API for querying the RAG model"
